@@ -30,8 +30,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let panel = app.current_panel_name();
     let total = app.filtered.len();
     let selected_count = app.selected.len();
-    let yay_ver = &app.yay_version;
-    let pacman_ver = &app.pacman_version;
 
     let offline_label = if app.offline {
         Span::styled(" [OFFLINE]", Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
@@ -61,10 +59,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(if selected_count > 0 { theme.yellow } else { theme.dim }),
         ),
         offline_label,
-        Span::styled(
-            format!("  {} / pacman {}", yay_ver, pacman_ver),
-            Style::default().fg(theme.dim),
-        ),
         Span::raw(" "),
     ]);
 

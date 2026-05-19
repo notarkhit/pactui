@@ -79,10 +79,6 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(panels_str, Style::default().fg(theme.dim)),
-        Span::styled(
-            format!("  {} ", app.yay_version),
-            Style::default().fg(theme.fg),
-        ),
     ]);
 
     let para = Paragraph::new(line).style(Style::default().bg(theme.header_bg));

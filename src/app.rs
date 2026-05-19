@@ -1,9 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
-use futures::StreamExt;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::interval;
 
 use crate::{
     cache::{self, Backend},
@@ -83,8 +81,6 @@ pub struct App {
     pub operation_output: Vec<String>,
     pub operation_done: bool,
     pub operation_progress: (usize, usize), // (done, total)
-    pub yay_version: String,
-    pub pacman_version: String,
     pub backend: Backend,
     pub tick_count: usize,
     pub loading_message: String,
@@ -98,8 +94,6 @@ impl App {
         let themes = theme::all_themes();
         let theme_index = theme::theme_by_name(&config.theme);
         let theme = themes[theme_index].clone();
-        let yay_ver = cache::get_version(backend.bin());
-        let pacman_ver = cache::get_version("pacman");
 
         Self {
             packages: vec![],
@@ -119,8 +113,6 @@ impl App {
             operation_output: vec![],
             operation_done: false,
             operation_progress: (0, 0),
-            yay_version: yay_ver,
-            pacman_version: pacman_ver,
             backend,
             tick_count: 0,
             loading_message: "Syncing package database...".to_string(),
@@ -143,15 +135,21 @@ impl App {
     }
 
     fn panel_packages(&self) -> Vec<Package> {
-        let panel = self.current_panel_name();
-        if panel == "selected" {
-            self.selected.iter().map(|s| s.package.clone()).collect()
-        } else {
-            self.all_packages
+        match self.current_panel_name().as_str() {
+            "selected" => self.selected.iter().map(|s| s.package.clone()).collect(),
+            "aur" => self
+                .all_packages
                 .iter()
-                .filter(|p| p.repo == panel)
+                .filter(|p| p.repo == "aur")
                 .cloned()
-                .collect()
+                .collect(),
+            // "pacman" — everything that isn't AUR
+            _ => self
+                .all_packages
+                .iter()
+                .filter(|p| p.repo != "aur")
+                .cloned()
+                .collect(),
         }
     }
 
@@ -266,41 +264,63 @@ impl App {
 
     // ── Operations ────────────────────────────────────────────────────────────
 
-    pub fn install_targets(&self) -> Vec<String> {
-        let install_queue: Vec<String> = self
+    /// Returns `(pacman_pkgs, aur_pkgs)` for install.
+    /// AUR = repo field is "aur". Everything else goes through pkexec pacman.
+    pub fn install_targets_split(&self) -> (Vec<String>, Vec<String>) {
+        let queue: Vec<&SelectedPackage> = self
             .selected
             .iter()
             .filter(|s| s.operation == QueuedOperation::Install)
-            .map(|s| s.package.name.clone())
             .collect();
 
-        if install_queue.is_empty() {
-            // Fall back to current highlighted package
-            self.current_package()
-                .filter(|p| !p.installed)
-                .map(|p| vec![p.name.clone()])
-                .unwrap_or_default()
-        } else {
-            install_queue
+        if queue.is_empty() {
+            return match self.current_package().filter(|p| !p.installed) {
+                Some(pkg) if pkg.repo == "aur" => (vec![], vec![pkg.name.clone()]),
+                Some(pkg) => (vec![pkg.name.clone()], vec![]),
+                None => (vec![], vec![]),
+            };
         }
+
+        let pacman = queue
+            .iter()
+            .filter(|s| s.package.repo != "aur")
+            .map(|s| s.package.name.clone())
+            .collect();
+        let aur = queue
+            .iter()
+            .filter(|s| s.package.repo == "aur")
+            .map(|s| s.package.name.clone())
+            .collect();
+        (pacman, aur)
     }
 
-    pub fn remove_targets(&self) -> Vec<String> {
-        let remove_queue: Vec<String> = self
+    /// Returns `(pacman_pkgs, aur_pkgs)` for remove.
+    pub fn remove_targets_split(&self) -> (Vec<String>, Vec<String>) {
+        let queue: Vec<&SelectedPackage> = self
             .selected
             .iter()
             .filter(|s| s.operation == QueuedOperation::Remove)
-            .map(|s| s.package.name.clone())
             .collect();
 
-        if remove_queue.is_empty() {
-            self.current_package()
-                .filter(|p| p.installed)
-                .map(|p| vec![p.name.clone()])
-                .unwrap_or_default()
-        } else {
-            remove_queue
+        if queue.is_empty() {
+            return match self.current_package().filter(|p| p.installed) {
+                Some(pkg) if pkg.repo == "aur" => (vec![], vec![pkg.name.clone()]),
+                Some(pkg) => (vec![pkg.name.clone()], vec![]),
+                None => (vec![], vec![]),
+            };
         }
+
+        let pacman = queue
+            .iter()
+            .filter(|s| s.package.repo != "aur")
+            .map(|s| s.package.name.clone())
+            .collect();
+        let aur = queue
+            .iter()
+            .filter(|s| s.package.repo == "aur")
+            .map(|s| s.package.name.clone())
+            .collect();
+        (pacman, aur)
     }
 }
 
@@ -341,124 +361,106 @@ pub async fn run(
         });
     }
 
-    // ── Tick timer (for spinner, debounce) ───────────────────────────────────
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(80));
-            loop {
-                ticker.tick().await;
-                if tx.send(AppEvent::Tick).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
     let mut event_stream = EventStream::new();
     let mut preview_debounce: Option<Instant> = None;
     let mut preview_pkg: Option<String> = None;
 
-    loop {
-        // ── Draw ──────────────────────────────────────────────────────────────
-        terminal.draw(|f| crate::ui::render(f, &app))?;
-
-        // ── Preview debounce flush ────────────────────────────────────────────
-        if let Some(t) = preview_debounce {
-            if t.elapsed() >= Duration::from_millis(200) {
-                preview_debounce = None;
-                if let Some(pkg_name) = preview_pkg.take() {
-                    let tx = tx.clone();
-                    let bin = app.backend.bin().to_string();
-                    tokio::spawn(async move {
-                        let output = tokio::process::Command::new(&bin)
-                            .args(["-Si", &pkg_name])
-                            .output()
-                            .await;
-                        if let Ok(out) = output {
-                            let s = String::from_utf8_lossy(&out.stdout).to_string();
-                            let info = parse_yay_si_output(&s);
-                            let _ = tx.send(AppEvent::PreviewReady(info)).await;
-                        }
-                    });
-                }
+    // ── 60fps batched render loop ─────────────────────────────────────────────
+    // One frame tick gate (16ms). Between gates we drain ALL pending events
+    // without blocking — rapid j/k keypresses collapse into a single repaint.
+    let mut frame_ticker = tokio::time::interval(Duration::from_millis(16));
+    // Slower spinner tick (80ms) sent as AppEvent::Tick
+    let tx_spin = tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(80));
+        loop {
+            ticker.tick().await;
+            if tx_spin.send(AppEvent::Tick).await.is_err() {
+                break;
             }
         }
+    });
 
-        // ── Event select ──────────────────────────────────────────────────────
-        tokio::select! {
-            Some(app_ev) = rx.recv() => {
-                match app_ev {
-                    AppEvent::Tick => {
-                        app.tick_count = app.tick_count.wrapping_add(1);
-                    }
-                    AppEvent::PackageFetchProgress(n) => {
-                        app.loading_message = format!("Syncing package database... ({} lines)", n);
-                    }
-                    AppEvent::PackageFetched(pkgs) => {
-                        // Save cache
-                        let _ = cache::save_cache(&pkgs);
+    'outer: loop {
+        // Wait for next frame slot
+        frame_ticker.tick().await;
 
-                        app.all_packages = pkgs;
-
-                        // Build panel list from pacman.conf + aur + selected
-                        let mut repos = cache::read_pacman_repos();
-                        if !repos.contains(&"aur".to_string()) {
-                            repos.push("aur".to_string());
+        // ── Drain all pending app events (non-blocking) ───────────────────────
+        loop {
+            match rx.try_recv() {
+                Ok(app_ev) => {
+                    match app_ev {
+                        AppEvent::Tick => {
+                            app.tick_count = app.tick_count.wrapping_add(1);
                         }
-                        repos.push("selected".to_string());
-                        app.panels = repos;
-
-                        app.rebuild_filtered();
-                        app.mode = AppMode::Normal;
-                    }
-                    AppEvent::PreviewReady(info) => {
-                        app.preview_cache = Some(info);
-                        app.preview_loading = false;
-                    }
-                    AppEvent::OperationLine(line) => {
-                        match line {
+                        AppEvent::PackageFetchProgress(n) => {
+                            app.loading_message =
+                                format!("Syncing package database... ({} lines)", n);
+                        }
+                        AppEvent::PackageFetched(pkgs) => {
+                            let _ = cache::save_cache(&pkgs);
+                            app.all_packages = pkgs;
+                            app.panels = vec![
+                                "pacman".to_string(),
+                                "aur".to_string(),
+                                "selected".to_string(),
+                            ];
+                            app.rebuild_filtered();
+                            app.mode = AppMode::Normal;
+                        }
+                        AppEvent::PreviewReady(info) => {
+                            app.preview_cache = Some(info);
+                            app.preview_loading = false;
+                        }
+                        AppEvent::OperationLine(line) => match line {
                             OperationLine::Stdout(s) | OperationLine::Stderr(s) => {
                                 app.operation_output.push(s);
-                                // Try to update progress heuristically
-                                let done = app.operation_output.iter()
-                                    .filter(|l| l.contains("installed") || l.contains("removed"))
+                                let done = app
+                                    .operation_output
+                                    .iter()
+                                    .filter(|l| {
+                                        l.contains("installed") || l.contains("removed")
+                                    })
                                     .count();
                                 app.operation_progress.0 = done;
                             }
                             OperationLine::Done { success } => {
                                 app.operation_done = true;
                                 if app.config.notify_on_complete {
-                                    let summary = if success {
-                                        "pactui: operation complete"
-                                    } else {
-                                        "pactui: operation failed"
-                                    };
-                                    notify::send(summary, "");
+                                    notify::send(
+                                        if success {
+                                            "pactui: operation complete"
+                                        } else {
+                                            "pactui: operation failed"
+                                        },
+                                        "",
+                                    );
                                 }
-                                // Refresh packages
-                                let tx = tx.clone();
+                                let tx2 = tx.clone();
                                 let b = app.backend;
                                 tokio::spawn(async move {
                                     let (prog_tx, _) = mpsc::channel::<usize>(1);
                                     if let Ok(pkgs) = cache::fetch_packages(b, prog_tx).await {
-                                        let _ = tx.send(AppEvent::PackageFetched(pkgs)).await;
+                                        let _ = tx2.send(AppEvent::PackageFetched(pkgs)).await;
                                     }
                                 });
                             }
-                        }
+                        },
                     }
                 }
+                Err(_) => break,
             }
+        }
 
-            Some(Ok(ev)) = event_stream.next() => {
-                match ev {
+        // ── Drain all pending input events (non-blocking poll) ────────────────
+        loop {
+            use futures::StreamExt as _;
+            match futures::poll!(std::pin::Pin::new(&mut event_stream).next()) {
+                std::task::Poll::Ready(Some(Ok(ev))) => match ev {
                     Event::Key(key) => {
                         if handle_key(&mut app, key, tx.clone()).await? {
-                            // Quit signal
-                            break;
+                            break 'outer;
                         }
-                        // Trigger preview debounce if cursor moved
                         if matches!(app.mode, AppMode::Normal) {
                             if let Some(pkg) = app.current_package() {
                                 let name = pkg.name.clone();
@@ -471,11 +473,37 @@ pub async fn run(
                             }
                         }
                     }
-                    Event::Resize(_, _) => {} // ratatui handles resize automatically
+                    Event::Resize(_, _) => {}
                     _ => {}
+                },
+                _ => break,
+            }
+        }
+
+        // ── Preview debounce flush ────────────────────────────────────────────
+        if let Some(t) = preview_debounce {
+            if t.elapsed() >= Duration::from_millis(200) {
+                preview_debounce = None;
+                if let Some(pkg_name) = preview_pkg.take() {
+                    let tx2 = tx.clone();
+                    let bin = app.backend.bin().to_string();
+                    tokio::spawn(async move {
+                        if let Ok(out) = tokio::process::Command::new(&bin)
+                            .args(["-Si", &pkg_name])
+                            .output()
+                            .await
+                        {
+                            let s = String::from_utf8_lossy(&out.stdout).to_string();
+                            let info = parse_yay_si_output(&s);
+                            let _ = tx2.send(AppEvent::PreviewReady(info)).await;
+                        }
+                    });
                 }
             }
         }
+
+        // ── Draw once per frame ───────────────────────────────────────────────
+        terminal.draw(|f| crate::ui::render(f, &app))?;
     }
 
     Ok(())
@@ -512,17 +540,16 @@ async fn handle_key(
                 app.mode = AppMode::OperationPane(OutputMode::Beautified);
             }
             KeyCode::Char('A') => {
-                let targets = app.install_targets();
-                if !targets.is_empty() {
-                    let total = targets.len();
+                let (pacman_pkgs, aur_pkgs) = app.install_targets_split();
+                let total = pacman_pkgs.len() + aur_pkgs.len();
+                if total > 0 {
                     app.operation_output.clear();
                     app.operation_done = false;
                     app.operation_progress = (0, total);
                     app.mode = AppMode::OperationPane(OutputMode::Beautified);
                     let tx = tx.clone();
-                    let b = app.backend;
                     tokio::spawn(async move {
-                        match operations::install(b, &targets).await {
+                        match operations::install(&pacman_pkgs, &aur_pkgs).await {
                             Ok(mut rx) => {
                                 while let Some(line) = rx.recv().await {
                                     let _ = tx.send(AppEvent::OperationLine(line)).await;
@@ -539,17 +566,16 @@ async fn handle_key(
                 }
             }
             KeyCode::Char('R') => {
-                let targets = app.remove_targets();
-                if !targets.is_empty() {
-                    let total = targets.len();
+                let (pacman_pkgs, aur_pkgs) = app.remove_targets_split();
+                let total = pacman_pkgs.len() + aur_pkgs.len();
+                if total > 0 {
                     app.operation_output.clear();
                     app.operation_done = false;
                     app.operation_progress = (0, total);
                     app.mode = AppMode::OperationPane(OutputMode::Beautified);
                     let tx = tx.clone();
-                    let b = app.backend;
                     tokio::spawn(async move {
-                        match operations::remove(b, &targets).await {
+                        match operations::remove(&pacman_pkgs, &aur_pkgs).await {
                             Ok(mut rx) => {
                                 while let Some(line) = rx.recv().await {
                                     let _ = tx.send(AppEvent::OperationLine(line)).await;

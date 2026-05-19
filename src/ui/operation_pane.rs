@@ -105,7 +105,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(theme.bg));
 
     let (done, total) = app.operation_progress;
-    let ratio = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+    let ratio = if total > 0 {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let label = format!("{}/{}", done, total);
     let gauge = Gauge::default()
         .block(progress_block)

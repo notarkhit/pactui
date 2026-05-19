@@ -12,8 +12,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
 
     let icon = match app.search_mode {
-        SearchMode::NameFuzzy | SearchMode::DescFuzzy => "󰊄 ",
-        SearchMode::NameExact | SearchMode::DescExact => "  ",
+        SearchMode::NameFuzzy => "󰊄 ",
+        SearchMode::NameExact => "  ",
     };
 
     let display = if app.search_query.is_empty() {
